@@ -10,7 +10,11 @@ import fs from 'fs';
 import os from 'os';
 
 // --- Initialize Google Cloud Clients ---
-const credentials = process.env.GOOGLE_APPLICATION_CREDENTIALS ? JSON.parse(fs.readFileSync(process.env.GOOGLE_APPLICATION_CREDENTIALS)) : undefined;
+const credentials = process.env.GOOGLE_APPLICATION_CREDENTIALS ? 
+    (process.env.GOOGLE_APPLICATION_CREDENTIALS.startsWith('{') ? 
+    JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS) : 
+    JSON.parse(fs.readFileSync(process.env.GOOGLE_APPLICATION_CREDENTIALS))) : 
+    undefined;
 const visionClient = new ImageAnnotatorClient({ credentials });
 const storage = new Storage({ credentials });
 
