@@ -134,7 +134,7 @@ app.listen(PORT, () => {
  * @param {string} originalFileName The name of the original file.
  * @param {number} width The target width for resizing.
  */
-const resizeAndSave = (sourceFile, destBucket, originalFileName, width) => {
+const resizeAndSave = (sourceFile, destBucket, originalFileName, width) => {.
     return new Promise((resolve, reject) => {
         const { name, dir } = path.parse(originalFileName);
         const newFileName = `${dir ? `${dir}/` : ''}${name}_w${width}.webp`;
