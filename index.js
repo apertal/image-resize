@@ -19,13 +19,13 @@ const visionClient = new ImageAnnotatorClient({ credentials });
 const storage = new Storage({ credentials });
 
 // --- Initialize Supabase Client ---
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_KEY;
+const supabaseUrl = process.env.SUPABASE_URL || '';
+const supabaseKey = process.env.SUPABASE_KEY || '';
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 // --- Configuration ---
-const PROCESSED_BUCKET_NAME = process.env.PROCESSED_BUCKET_NAME;
-const RESIZE_WIDTHS = (process.env.RESIZE_DIMENSIONS).split(',').map(Number);
+const PROCESSED_BUCKET_NAME = process.env.PROCESSED_BUCKET_NAME || '';
+const RESIZE_WIDTHS = (process.env.RESIZE_DIMENSIONS || '').split(',').map(Number);
 
 // --- Express App ---
 const app = express();
@@ -78,6 +78,7 @@ const processImage = async (req, res) => {
         // --- 3. EXIF Extraction and Supabase Update ---
         console.log(`[${fileName}] Extracting EXIF data.`);
         const exifData = await exiftool.read(tempFilePath);
+        exiftool.end();
         const sha256 = exifData.File.SHA256;
 
         if (sha256) {
@@ -102,9 +103,31 @@ const processImage = async (req, res) => {
             resizeAndSave(originalFile, destinationBucket, fileName, width)
         );
 
-        // Wait for all resize operations to complete.
-        await Promise.all(resizePromises);
-        console.log(`[${fileName}] All resized versions created successfully.`);
+        const createdImageNames = [];
+        try {
+            const results = await Promise.all(resizePromises.map(p => p.catch(e => e)));
+            const successfulResults = results.filter(r => !(r instanceof Error));
+            createdImageNames.push(...successfulResults);
+
+            const failedResults = results.filter(r => r instanceof Error);
+            if (failedResults.length > 0) {
+                throw new Error(`${failedResults.length} resize operations failed`);
+            }
+
+            console.log(`[${fileName}] All resized versions created successfully.`);
+        } catch (error) {
+            console.error(`[${fileName}] An error occurred during resizing:`, error);
+            // Delete any successfully created images
+            for (const imageName of createdImageNames) {
+                try {
+                    await destinationBucket.file(imageName).delete();
+                    console.log(`[${fileName}] Deleted successfully created image: ${imageName}`);
+                } catch (deleteError) {
+                    console.error(`[${fileName}] Failed to delete successfully created image: ${imageName}`, deleteError);
+                }
+            }
+            throw error;
+        }
 
         // --- 5. Move Original File to Processed Bucket ---
         console.log(`[${fileName}] Moving original file to processed bucket.`);
@@ -161,7 +184,7 @@ const resizeAndSave = (sourceFile, destBucket, originalFileName, width) => {
             .pipe(writeStream)
             .on('finish', () => {
                 console.log(`Successfully created resized image: ${newFileName}`);
-                resolve();
+                resolve(newFileName);
             })
             .on('error', (err) => {
                 console.error(`Failed to create resized image: ${newFileName}`, err);
