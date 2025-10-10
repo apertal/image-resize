@@ -10,8 +10,9 @@ import fs from 'fs';
 import os from 'os';
 
 // --- Initialize Google Cloud Clients ---
-const visionClient = new ImageAnnotatorClient();
-const storage = new Storage();
+const credentials = process.env.GOOGLE_APPLICATION_CREDENTIALS ? JSON.parse(fs.readFileSync(process.env.GOOGLE_APPLICATION_CREDENTIALS)) : undefined;
+const visionClient = new ImageAnnotatorClient({ credentials });
+const storage = new Storage({ credentials });
 
 // --- Initialize Supabase Client ---
 const supabaseUrl = process.env.SUPABASE_URL;
