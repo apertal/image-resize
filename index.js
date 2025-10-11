@@ -57,7 +57,44 @@ const processImage = async (req, res) => {
         // --- 1. Download file for processing ---
         await originalFile.download({ destination: tempFilePath });
 
-        // --- 2. Safety Check with Vision AI ---
+        // --- 2. EXIF Extraction and SHA256 Calculation ---
+        console.log(`[${fileName}] Extracting EXIF data.`);
+        const exifData = await exiftool.read(tempFilePath);
+        const sha256 = exifData.File.SHA256;
+
+        if (sha256) {
+            console.log(`[${fileName}] SHA256: ${sha256}`);
+
+            // --- 3. Check if image exists in Supabase ---
+            const { data: existingImage, error: selectError } = await supabase
+                .from('images')
+                .select('sha256')
+                .eq('sha256', sha256)
+                .single();
+
+            if (selectError && selectError.code !== 'PGRST116') { // PGRST116: "Not a single row was found"
+                console.error(`[${fileName}] Supabase select error:`, selectError);
+                throw new Error('Supabase select error'); // Stop processing on database error
+            }
+
+            if (!existingImage) {
+                console.warn(`[${fileName}] Image with SHA256 ${sha256} not found in database. Deleting original file.`);
+                await originalFile.delete();
+                console.log(`[${fileName}] Deleted successfully.`);
+                return res.status(400).send(`Image ${fileName} with SHA256 ${sha256} is not registered.`);
+            }
+
+        } else {
+            console.warn(`[${fileName}] Could not determine SHA256 hash of the image.`);
+            // If we can't get a hash, we can't check the database.
+            // Let's stop processing here as well, as the SHA is crucial.
+            await originalFile.delete();
+            console.log(`[${fileName}] Deleted successfully.`);
+            return res.status(400).send(`Could not determine SHA256 for ${fileName}.`);
+        }
+
+
+        // --- 4. Safety Check with Vision AI ---
         console.log(`[${fileName}] Performing SafeSearch detection.`);
         const [result] = await visionClient.safeSearchDetection(tempFilePath);
         const detections = result.safeSearchAnnotation;
@@ -75,30 +112,21 @@ const processImage = async (req, res) => {
         }
         console.log(`[${fileName}] SafeSearch check passed.`);
 
-        // --- 3. EXIF Extraction and Supabase Update ---
-        console.log(`[${fileName}] Extracting EXIF data.`);
-        const exifData = await exiftool.read(tempFilePath);
-        exiftool.end();
-        const sha256 = exifData.File.SHA256;
+        // --- 5. Supabase Update with EXIF data ---
+        console.log(`[${fileName}] Updating Supabase record.`);
+        const { data, error } = await supabase
+            .from('images')
+            .update({ exif: exifData })
+            .eq('sha256', sha256);
 
-        if (sha256) {
-            console.log(`[${fileName}] SHA256: ${sha256}`);
-            console.log(`[${fileName}] Updating Supabase record.`);
-            const { data, error } = await supabase
-                .from('images')
-                .update({ exif: exifData })
-                .eq('sha256', sha256);
-
-            if (error) {
-                console.error(`[${fileName}] Supabase update error:`, error);
-            } else {
-                console.log(`[${fileName}] Supabase record updated successfully.`);
-            }
+        if (error) {
+            console.error(`[${fileName}] Supabase update error:`, error);
         } else {
-            console.warn(`[${fileName}] Could not determine SHA256 hash of the image.`);
+            console.log(`[${fileName}] Supabase record updated successfully.`);
         }
 
-        // --- 4. Generate Resized Images ---
+
+        // --- 6. Generate Resized Images ---
         const resizePromises = RESIZE_WIDTHS.map(width =>
             resizeAndSave(originalFile, destinationBucket, fileName, width)
         );
@@ -129,7 +157,7 @@ const processImage = async (req, res) => {
             throw error;
         }
 
-        // --- 5. Move Original File to Processed Bucket ---
+        // --- 7. Move Original File to Processed Bucket ---
         console.log(`[${fileName}] Moving original file to processed bucket.`);
         await originalFile.move(destinationBucket.file(`original-${fileName}`));
         console.log(`[${fileName}] Original file moved successfully.`);

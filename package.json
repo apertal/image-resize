@@ -2,6 +2,7 @@
   "name": "image-resize",
   "version": "1.0.0",
   "description": "Image processing service for resizing and SafeSearch detection.",
+  "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
