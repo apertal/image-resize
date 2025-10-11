@@ -196,7 +196,6 @@ const processImage = async (req, res) => {
         } catch (e) {
             console.error(`[${fileName}] Error deleting temporary file:`, e);
         }
-        exiftool.end();
         console.log(`[END] Finished processing for file: ${fileName}.`);
     }
 };
