@@ -70,9 +70,9 @@ const processImage = async (req, res) => {
         // --- 2. Calculate SHA256 Hash ---
         console.log(`[${fileName}] Step 2: Calculating SHA256 hash.`);
         const imageBuffer = fs.readFileSync(tempFilePath);
-        const hash = crypto.createHash('sha256');
-        hash.update(imageBuffer);
-        const sha256 = hash.digest('hex');
+        const sha256Buffer = await crypto.subtle.digest("SHA-256", imageBuffer);
+        const hashArray = Array.from(new Uint8Array(sha256Buffer));
+        const sha256 = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
         console.log(`[${fileName}] Step 2: SHA256 hash calculation complete.`);
 
         // --- 3. EXIF Extraction ---
