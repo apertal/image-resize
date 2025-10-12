@@ -122,13 +122,18 @@ const processImage = async (req, res) => {
         resizeResults.forEach(r => { processedSizes[r.width] = r.fileName; });
 
         console.log(`[${gcsFilePath}] Step 6: Updating Supabase record via RPC.`);
-        const { error: rpcError } = await supabase.rpc('update_image_processing_results', {
+        const rpcPayload = {
             image_id_input: imageRecord.id,
             exif_data_input: sanitizedExifData,
             processed_sizes_input: processedSizes
-        });
+        };
+        console.log(`[${gcsFilePath}] RPC Payload:`, JSON.stringify(rpcPayload, null, 2));
+        const { error: rpcError } = await supabase.rpc('update_image_processing_results', rpcPayload);
 
-        if (rpcError) throw rpcError;
+        if (rpcError) {
+            console.error(`[${gcsFilePath}] Supabase RPC Error:`, JSON.stringify(rpcError, null, 2));
+            throw rpcError;
+        }
         console.log(`[${gcsFilePath}] Supabase RPC call successful.`);
 
         console.log(`[${gcsFilePath}] Step 7: Moving original file.`);
