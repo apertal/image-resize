@@ -8,6 +8,27 @@ import { exiftool } from 'exiftool-vendored';
 import fs from 'fs';
 import os from 'os';
 
+// --- Helper function to read secrets ---
+const readSecret = (secretName) => {
+    try {
+        // Check for file path first (for Google Secret Manager)
+        const secretPath = `/secrets/${secretName}`;
+        if (fs.existsSync(secretPath)) {
+            return fs.readFileSync(secretPath, 'utf-8').trim();
+        }
+    } catch (err) {
+        console.warn(`Could not read secret [${secretName}] from file path. Falling back to environment variable.`, err);
+    }
+
+    // Fallback to environment variable (for local development)
+    const envVar = process.env[secretName];
+    if (envVar) {
+        return envVar;
+    }
+
+    return '';
+};
+
 // --- Initialize Google Cloud Clients ---
 const credentials = process.env.GOOGLE_APPLICATION_CREDENTIALS ?
     (process.env.GOOGLE_APPLICATION_CREDENTIALS.startsWith('{') ?
@@ -18,24 +39,25 @@ const visionClient = new ImageAnnotatorClient({ credentials });
 const storage = new Storage({ credentials });
 
 // --- Initialize Supabase Client ---
-const supabaseUrl = process.env.SUPABASE_URL || '';
-const supabaseKey = process.env.SUPABASE_KEY || '';
+const supabaseUrl = readSecret('SUPABASE_URL');
+const supabaseKey = readSecret('SUPABASE_KEY');
+
+if (!supabaseUrl || !supabaseKey) {
+    console.error('Supabase URL or Key could not be loaded. Check environment variables or Secret Manager configuration.');
+    // Exit if Supabase is not configured, to prevent the service from running in a broken state.
+    process.exit(1);
+}
+
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 // --- Configuration ---
-const PROCESSED_BUCKET_NAME = process.env.PROCESSED_BUCKET_NAME || '';
-const RESIZE_WIDTHS = (process.env.RESIZE_DIMENSIONS || '').split(',').map(Number).filter(w => w > 0);
+const PROCESSED_BUCKET_NAME = readSecret('PROCESSED_BUCKET_NAME') || process.env.PROCESSED_BUCKET_NAME;
+const RESIZE_WIDTHS = (readSecret('RESIZE_DIMENSIONS') || process.env.RESIZE_DIMENSIONS || '').split(',').map(Number).filter(w => w > 0);
 
 // --- Express App ---
 const app = express();
 app.use(express.json());
 
-/**
- * Processes an image based on a POST request.
- *
- * @param {object} req The Express request object.
- * @param {object} res The Express response object.
- */
 const processImage = async (req, res) => {
     console.log('Received request:', JSON.stringify(req.body));
     const { bucket, name } = req.body;
@@ -46,7 +68,7 @@ const processImage = async (req, res) => {
     }
 
     const sourceBucketName = bucket;
-    const gcsFilePath = name; // The full path to the file in the source bucket
+    const gcsFilePath = name;
 
     const sourceBucket = storage.bucket(sourceBucketName);
     const destinationBucket = storage.bucket(PROCESSED_BUCKET_NAME);
@@ -56,17 +78,15 @@ const processImage = async (req, res) => {
     console.log(`[START] Processing file: ${gcsFilePath} from bucket: ${sourceBucketName}.`);
 
     try {
-        // --- 1. Download file for processing ---
         console.log(`[${gcsFilePath}] Step 1: Downloading file.`);
         fs.mkdirSync(path.dirname(tempFilePath), { recursive: true });
         await originalFile.download({ destination: tempFilePath });
         console.log(`[${gcsFilePath}] Step 1: Download complete.`);
 
-        // --- 2. Find image record in Supabase using file path ---
         console.log(`[${gcsFilePath}] Step 2: Finding image record in Supabase.`);
         const { data: imageRecord, error: findError } = await supabase
             .from('images')
-            .select('id') // Just need the ID for the update
+            .select('id')
             .eq('gcs_file_path', gcsFilePath)
             .single();
 
@@ -76,30 +96,19 @@ const processImage = async (req, res) => {
         }
         console.log(`[${gcsFilePath}] Step 2: Found image record with ID: ${imageRecord.id}.`);
 
-        // --- 3. EXIF Extraction and Pruning ---
-        console.log(`[${gcsFilePath}] Step 3: Extracting EXIF data.`);
+        console.log(`[${gcsFilePath}] Step 3: Extracting and pruning EXIF data.`);
         const exifData = await exiftool.read(tempFilePath);
-        console.log(`[${gcsFilePath}] Step 3: EXIF extraction complete.`);
 
-        if (exifData.ThumbnailImage) {
-            console.log(`[${gcsFilePath}] Pruning ThumbnailImage from EXIF data.`);
-            delete exifData.ThumbnailImage;
-        }
-        if (exifData.PreviewImage) {
-            console.log(`[${gcsFilePath}] Pruning PreviewImage from EXIF data.`);
-            delete exifData.PreviewImage;
-        }
+        if (exifData.ThumbnailImage) delete exifData.ThumbnailImage;
+        if (exifData.PreviewImage) delete exifData.PreviewImage;
 
-        // Sanitize the exifData object to ensure it's purely JSON-compatible
         const exifDataString = JSON.stringify(exifData);
         const sanitizedExifData = JSON.parse(exifDataString);
         console.log(`[${gcsFilePath}] Size of sanitized EXIF data payload: ${exifDataString.length} bytes.`);
 
-        // --- 4. Safety Check with Vision AI ---
         console.log(`[${gcsFilePath}] Step 4: Performing SafeSearch detection.`);
         const [result] = await visionClient.safeSearchDetection(tempFilePath);
         const detections = result.safeSearchAnnotation;
-        console.log(`[${gcsFilePath}] Step 4: SafeSearch detection complete.`);
 
         const isUnsafe = ['VERY_LIKELY', 'LIKELY'].some(likelihood =>
             [detections.adult, detections.violence, detections.racy].includes(likelihood)
@@ -108,12 +117,10 @@ const processImage = async (req, res) => {
         if (isUnsafe) {
             console.warn(`[${gcsFilePath}] Unsafe image detected. Deleting original file.`);
             await originalFile.delete();
-            console.log(`[${gcsFilePath}] Deleted successfully.`);
             return res.status(200).send(`Unsafe image ${gcsFilePath} deleted.`);
         }
         console.log(`[${gcsFilePath}] SafeSearch check passed.`);
 
-        // --- 5. Generate Resized Images ---
         console.log(`[${gcsFilePath}] Step 5: Generating resized images.`);
         const resizePromises = RESIZE_WIDTHS.map(width =>
             resizeAndSave(tempFilePath, destinationBucket, gcsFilePath, width)
@@ -135,14 +142,11 @@ const processImage = async (req, res) => {
                 failedResults.forEach(e => console.error(`[${gcsFilePath}] A resize operation failed:`, e));
                 throw new Error(`${failedResults.length} resize operations failed`);
             }
-
-            console.log(`[${gcsFilePath}] All resized versions created successfully.`);
         } catch (error) {
             console.error(`[${gcsFilePath}] An error occurred during resizing, cleaning up created images.`, error);
             for (const imageName of createdImageNames) {
                 try {
                     await destinationBucket.file(imageName).delete();
-                    console.log(`[${gcsFilePath}] Deleted successfully created image: ${imageName}`);
                 } catch (deleteError) {
                     console.error(`[${gcsFilePath}] Failed to delete successfully created image: ${imageName}`, deleteError);
                 }
@@ -151,13 +155,12 @@ const processImage = async (req, res) => {
         }
         console.log(`[${gcsFilePath}] Step 5: Resizing complete.`);
 
-        // --- 6. Final Supabase Update ---
         console.log(`[${gcsFilePath}] Step 6: Updating Supabase record.`);
         try {
             const { data: updatedData, error: updateError } = await supabase
                 .from('images')
                 .update({
-                    exif: sanitizedExifData, // Use the sanitized object
+                    exif: sanitizedExifData,
                     processed_sizes: processedSizes,
                     processed: true
                 })
@@ -169,15 +172,13 @@ const processImage = async (req, res) => {
             if (updatedData && updatedData.length > 0) {
                 console.log(`[${gcsFilePath}] Supabase record updated successfully. Response:`, JSON.stringify(updatedData));
             } else {
-                console.warn(`[${gcsFilePath}] Supabase update call returned no data. 0 rows may have been updated. Check RLS policies and permissions.`);
+                console.warn(`[${gcsFilePath}] Supabase update call returned no data. 0 rows may have been updated. Check RLS policies.`);
             }
         } catch (err) {
-            // Log the raw error object for better inspection
             console.error(`[${gcsFilePath}] Exception during Supabase update:`, err);
-            throw new Error('Supabase update error');
+            throw err; // Re-throw original error
         }
 
-        // --- 7. Move Original File to Processed Bucket ---
         console.log(`[${gcsFilePath}] Step 7: Moving original file to processed bucket.`);
         const destinationPath = path.join('originals', path.basename(gcsFilePath));
         await originalFile.move(destinationBucket.file(destinationPath));
@@ -186,7 +187,7 @@ const processImage = async (req, res) => {
         res.status(200).send(`Successfully processed ${gcsFilePath}.`);
 
     } catch (error) {
-        console.error(`[${gcsFilePath}] An error occurred during processing:`, error.message);
+        console.error(`[${gcsFilePath}] An error occurred during processing:`, error);
         res.status(500).send(`Error processing ${gcsFilePath}.`);
     } finally {
         try {
@@ -207,13 +208,6 @@ app.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
 });
 
-/**
- * Helper function to resize an image and save it to the destination bucket.
- * @param {string} sourceTempPath The temporary local path to the source image.
- * @param {object} destBucket The GCS bucket object for the destination.
- * @param {string} originalGcsPath The original GCS path of the file.
- * @param {number} width The target width for resizing.
- */
 const resizeAndSave = (sourceTempPath, destBucket, originalGcsPath, width) => {
     return new Promise((resolve, reject) => {
         const originalPathParts = path.parse(originalGcsPath);
