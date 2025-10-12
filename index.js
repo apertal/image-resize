@@ -140,21 +140,28 @@ const processImage = async (req, res) => {
 
         // --- 6. Final Supabase Update ---
         console.log(`[${gcsFilePath}] Step 6: Updating Supabase record with EXIF and resized paths.`);
-        const { error: updateError } = await supabase
+        const { data: updatedData, error: updateError } = await supabase
             .from('images')
             .update({
                 exif: exifData,
                 processed_sizes: processedSizes,
                 processed: true
             })
-            .eq('id', imageRecord.id);
+            .eq('id', imageRecord.id)
+            .select(); // IMPORTANT: .select() returns the updated rows
 
         if (updateError) {
             console.error(`[${gcsFilePath}] Supabase update error:`, updateError);
             // If the update fails, the operation is considered failed. The main catch block will handle it.
             throw new Error('Supabase update error');
         }
-        console.log(`[${gcsFilePath}] Supabase record updated successfully.`);
+
+        // New logging to verify the update
+        if (updatedData && updatedData.length > 0) {
+            console.log(`[${gcsFilePath}] Supabase record updated successfully. Response:`, JSON.stringify(updatedData));
+        } else {
+            console.warn(`[${gcsFilePath}] Supabase update call returned no data. 0 rows may have been updated. Check RLS policies and permissions.`);
+        }
 
         // --- 7. Move Original File to Processed Bucket ---
         console.log(`[${gcsFilePath}] Step 7: Moving original file to processed bucket.`);
@@ -206,9 +213,7 @@ const resizeAndSave = (sourceTempPath, destBucket, originalGcsPath, width) => {
         const transformer = sharp(sourceTempPath)
             .resize(width)
             .webp({
-                nearLossless: true,
-                quality: 95,
-                effort: 3
+                quality: 80, // Adjusted for better compression
             });
 
         transformer
