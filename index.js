@@ -81,7 +81,6 @@ const processImage = async (req, res) => {
         const exifData = await exiftool.read(tempFilePath);
         console.log(`[${gcsFilePath}] Step 3: EXIF extraction complete.`);
 
-        // Prune large binary tags from EXIF data to prevent payload size errors
         if (exifData.ThumbnailImage) {
             console.log(`[${gcsFilePath}] Pruning ThumbnailImage from EXIF data.`);
             delete exifData.ThumbnailImage;
@@ -91,8 +90,10 @@ const processImage = async (req, res) => {
             delete exifData.PreviewImage;
         }
 
+        // Sanitize the exifData object to ensure it's purely JSON-compatible
         const exifDataString = JSON.stringify(exifData);
-        console.log(`[${gcsFilePath}] Size of pruned EXIF data payload: ${exifDataString.length} bytes.`);
+        const sanitizedExifData = JSON.parse(exifDataString);
+        console.log(`[${gcsFilePath}] Size of sanitized EXIF data payload: ${exifDataString.length} bytes.`);
 
         // --- 4. Safety Check with Vision AI ---
         console.log(`[${gcsFilePath}] Step 4: Performing SafeSearch detection.`);
@@ -156,7 +157,7 @@ const processImage = async (req, res) => {
             const { data: updatedData, error: updateError } = await supabase
                 .from('images')
                 .update({
-                    exif: exifData,
+                    exif: sanitizedExifData, // Use the sanitized object
                     processed_sizes: processedSizes,
                     processed: true
                 })
@@ -171,7 +172,8 @@ const processImage = async (req, res) => {
                 console.warn(`[${gcsFilePath}] Supabase update call returned no data. 0 rows may have been updated. Check RLS policies and permissions.`);
             }
         } catch (err) {
-            console.error(`[${gcsFilePath}] Exception during Supabase update:`, JSON.stringify(err, null, 2));
+            // Log the raw error object for better inspection
+            console.error(`[${gcsFilePath}] Exception during Supabase update:`, err);
             throw new Error('Supabase update error');
         }
 
