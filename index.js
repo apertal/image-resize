@@ -5,15 +5,14 @@ import path from 'path';
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import { exiftool } from 'exiftool-vendored';
-import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 
 // --- Initialize Google Cloud Clients ---
-const credentials = process.env.GOOGLE_APPLICATION_CREDENTIALS ? 
-    (process.env.GOOGLE_APPLICATION_CREDENTIALS.startsWith('{') ? 
-    JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS) : 
-    JSON.parse(fs.readFileSync(process.env.GOOGLE_APPLICATION_CREDENTIALS))) : 
+const credentials = process.env.GOOGLE_APPLICATION_CREDENTIALS ?
+    (process.env.GOOGLE_APPLICATION_CREDENTIALS.startsWith('{') ?
+    JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS) :
+    JSON.parse(fs.readFileSync(process.env.GOOGLE_APPLICATION_CREDENTIALS))) :
     undefined;
 const visionClient = new ImageAnnotatorClient({ credentials });
 const storage = new Storage({ credentials });
@@ -25,7 +24,7 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 
 // --- Configuration ---
 const PROCESSED_BUCKET_NAME = process.env.PROCESSED_BUCKET_NAME || '';
-const RESIZE_WIDTHS = (process.env.RESIZE_DIMENSIONS || '').split(',').map(Number);
+const RESIZE_WIDTHS = (process.env.RESIZE_DIMENSIONS || '').split(',').map(Number).filter(w => w > 0);
 
 // --- Express App ---
 const app = express();
@@ -47,156 +46,136 @@ const processImage = async (req, res) => {
     }
 
     const sourceBucketName = bucket;
-    const fileName = name;
-    
-    console.log(`Source bucket: ${sourceBucketName}`);
-    console.log(`Processed bucket name from env: ${process.env.PROCESSED_BUCKET_NAME}`);
+    const gcsFilePath = name; // The full path to the file in the source bucket
 
     const sourceBucket = storage.bucket(sourceBucketName);
     const destinationBucket = storage.bucket(PROCESSED_BUCKET_NAME);
-    const originalFile = sourceBucket.file(fileName);
-    const tempFilePath = path.join(os.tmpdir(), fileName);
+    const originalFile = sourceBucket.file(gcsFilePath);
+    const tempFilePath = path.join(os.tmpdir(), path.basename(gcsFilePath));
 
-    console.log(`[START] Processing file: ${fileName} from bucket: ${sourceBucketName}.`);
+    console.log(`[START] Processing file: ${gcsFilePath} from bucket: ${sourceBucketName}.`);
 
     try {
         // --- 1. Download file for processing ---
-        console.log(`[${fileName}] Step 1: Downloading file.`);
-        // Ensure the temporary directory exists
+        console.log(`[${gcsFilePath}] Step 1: Downloading file.`);
         fs.mkdirSync(path.dirname(tempFilePath), { recursive: true });
         await originalFile.download({ destination: tempFilePath });
-        console.log(`[${fileName}] Step 1: Download complete.`);
+        console.log(`[${gcsFilePath}] Step 1: Download complete.`);
 
-        // --- 2. Calculate SHA256 Hash ---
-        console.log(`[${fileName}] Step 2: Calculating SHA256 hash.`);
-        const imageBuffer = fs.readFileSync(tempFilePath);
-        const sha256Buffer = await crypto.subtle.digest("SHA-256", imageBuffer);
-        const hashArray = Array.from(new Uint8Array(sha256Buffer));
-        const sha256 = hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-        console.log(`[${fileName}] Step 2: SHA256 hash calculation complete.`);
+        // --- 2. Find image record in Supabase using file path ---
+        console.log(`[${gcsFilePath}] Step 2: Finding image record in Supabase.`);
+        const { data: imageRecord, error: findError } = await supabase
+            .from('images')
+            .select('id') // Just need the ID for the update
+            .eq('gcs_file_path', gcsFilePath)
+            .single();
+
+        if (findError || !imageRecord) {
+            console.error(`[${gcsFilePath}] Image with path ${gcsFilePath} not found in database.`, findError);
+            return res.status(404).send(`Image with path ${gcsFilePath} not found in database.`);
+        }
+        console.log(`[${gcsFilePath}] Step 2: Found image record with ID: ${imageRecord.id}.`);
 
         // --- 3. EXIF Extraction ---
-        console.log(`[${fileName}] Step 3: Extracting EXIF data.`);
+        console.log(`[${gcsFilePath}] Step 3: Extracting EXIF data.`);
         const exifData = await exiftool.read(tempFilePath);
-        console.log(`[${fileName}] Step 3: EXIF extraction complete.`);
+        console.log(`[${gcsFilePath}] Step 3: EXIF extraction complete.`);
 
-        if (sha256) {
-            console.log(`[${fileName}] SHA256: ${sha256}`);
-
-            // --- 4. Check if image exists in Supabase ---
-            console.log(`[${fileName}] Step 4: Checking for existing image in Supabase.`);
-            const { data: existingImage, error: selectError } = await supabase
-                .from('images')
-                .select('sha256')
-                .eq('sha256', sha256)
-                .single();
-            console.log(`[${fileName}] Step 4: Supabase check complete.`);
-
-            if (selectError && selectError.code !== 'PGRST116') { // PGRST116: "Not a single row was found"
-                console.error(`[${fileName}] Supabase select error:`, selectError);
-                throw new Error('Supabase select error'); // Stop processing on database error
-            }
-
-            if (!existingImage) {
-                console.warn(`[${fileName}] Image with SHA256 ${sha256} not found in database. Deleting original file.`);
-                await originalFile.delete();
-                console.log(`[${fileName}] Deleted successfully.`);
-                return res.status(400).send(`Image ${fileName} with SHA256 ${sha256} is not registered.`);
-            }
-
-        } else {
-            // This case should not happen with the new crypto method, but we keep it for safety.
-            console.warn(`[${fileName}] Could not determine SHA256 hash of the image.`);
-            await originalFile.delete();
-            console.log(`[${fileName}] Deleted successfully.`);
-            return res.status(400).send(`Could not determine SHA256 for ${fileName}.`);
-        }
-
-
-        // --- 5. Safety Check with Vision AI ---
-        console.log(`[${fileName}] Step 5: Performing SafeSearch detection.`);
+        // --- 4. Safety Check with Vision AI ---
+        console.log(`[${gcsFilePath}] Step 4: Performing SafeSearch detection.`);
         const [result] = await visionClient.safeSearchDetection(tempFilePath);
         const detections = result.safeSearchAnnotation;
-        console.log(`[${fileName}] Step 5: SafeSearch detection complete.`);
+        console.log(`[${gcsFilePath}] Step 4: SafeSearch detection complete.`);
 
         const isUnsafe = ['VERY_LIKELY', 'LIKELY'].some(likelihood =>
             [detections.adult, detections.violence, detections.racy].includes(likelihood)
         );
 
         if (isUnsafe) {
-            console.warn(`[${fileName}] Unsafe image detected. Deleting original file.`);
+            console.warn(`[${gcsFilePath}] Unsafe image detected. Deleting original file.`);
             await originalFile.delete();
-            console.log(`[${fileName}] Deleted successfully.`);
-            return res.status(200).send(`Unsafe image ${fileName} deleted.`);
+            console.log(`[${gcsFilePath}] Deleted successfully.`);
+            return res.status(200).send(`Unsafe image ${gcsFilePath} deleted.`);
         }
-        console.log(`[${fileName}] SafeSearch check passed.`);
+        console.log(`[${gcsFilePath}] SafeSearch check passed.`);
 
-        // --- 6. Supabase Update with EXIF data ---
-        console.log(`[${fileName}] Step 6: Updating Supabase record.`);
-        const { data, error } = await supabase
-            .from('images')
-            .update({ exif: exifData })
-            .eq('sha256', sha256);
-        console.log(`[${fileName}] Step 6: Supabase update complete.`);
-
-        if (error) {
-            console.error(`[${fileName}] Supabase update error:`, error);
-        } else {
-            console.log(`[${fileName}] Supabase record updated successfully.`);
-        }
-
-
-        // --- 7. Generate Resized Images ---
-        console.log(`[${fileName}] Step 7: Generating resized images.`);
+        // --- 5. Generate Resized Images ---
+        console.log(`[${gcsFilePath}] Step 5: Generating resized images.`);
         const resizePromises = RESIZE_WIDTHS.map(width =>
-            resizeAndSave(originalFile, destinationBucket, fileName, width)
+            resizeAndSave(tempFilePath, destinationBucket, gcsFilePath, width)
         );
 
+        const processedSizes = {};
         const createdImageNames = [];
         try {
-            const results = await Promise.all(resizePromises.map(p => p.catch(e => e)));
-            const successfulResults = results.filter(r => !(r instanceof Error));
-            createdImageNames.push(...successfulResults);
+            const resizeResults = await Promise.all(resizePromises.map(p => p.catch(e => e)));
+            const successfulResults = resizeResults.filter(r => !(r instanceof Error));
 
-            const failedResults = results.filter(r => r instanceof Error);
+            successfulResults.forEach(r => {
+                createdImageNames.push(r.fileName);
+                processedSizes[r.width] = r.fileName;
+            });
+
+            const failedResults = resizeResults.filter(r => r instanceof Error);
             if (failedResults.length > 0) {
+                // Log each error for better debugging
+                failedResults.forEach(e => console.error(`[${gcsFilePath}] A resize operation failed:`, e));
                 throw new Error(`${failedResults.length} resize operations failed`);
             }
 
-            console.log(`[${fileName}] All resized versions created successfully.`);
+            console.log(`[${gcsFilePath}] All resized versions created successfully.`);
         } catch (error) {
-            console.error(`[${fileName}] An error occurred during resizing:`, error);
+            console.error(`[${gcsFilePath}] An error occurred during resizing, cleaning up created images.`, error);
             for (const imageName of createdImageNames) {
                 try {
                     await destinationBucket.file(imageName).delete();
-                    console.log(`[${fileName}] Deleted successfully created image: ${imageName}`);
+                    console.log(`[${gcsFilePath}] Deleted successfully created image: ${imageName}`);
                 } catch (deleteError) {
-                    console.error(`[${fileName}] Failed to delete successfully created image: ${imageName}`, deleteError);
+                    console.error(`[${gcsFilePath}] Failed to delete successfully created image: ${imageName}`, deleteError);
                 }
             }
-            throw error;
+            throw error; // Re-throw to be caught by the main try-catch block
         }
-        console.log(`[${fileName}] Step 7: Resizing complete.`);
+        console.log(`[${gcsFilePath}] Step 5: Resizing complete.`);
 
-        // --- 8. Move Original File to Processed Bucket ---
-        console.log(`[${fileName}] Step 8: Moving original file to processed bucket.`);
-        await originalFile.move(destinationBucket.file(`original-${fileName}`));
-        console.log(`[${fileName}] Step 8: Move complete.`);
+        // --- 6. Final Supabase Update ---
+        console.log(`[${gcsFilePath}] Step 6: Updating Supabase record with EXIF and resized paths.`);
+        const { error: updateError } = await supabase
+            .from('images')
+            .update({
+                exif: exifData,
+                processed_sizes: processedSizes,
+                processed: true
+            })
+            .eq('id', imageRecord.id);
 
-        res.status(200).send(`Successfully processed ${fileName}.`);
+        if (updateError) {
+            console.error(`[${gcsFilePath}] Supabase update error:`, updateError);
+            // If the update fails, the operation is considered failed. The main catch block will handle it.
+            throw new Error('Supabase update error');
+        }
+        console.log(`[${gcsFilePath}] Supabase record updated successfully.`);
+
+        // --- 7. Move Original File to Processed Bucket ---
+        console.log(`[${gcsFilePath}] Step 7: Moving original file to processed bucket.`);
+        const destinationPath = path.join('originals', path.basename(gcsFilePath));
+        await originalFile.move(destinationBucket.file(destinationPath));
+        console.log(`[${gcsFilePath}] Step 7: Move complete.`);
+
+        res.status(200).send(`Successfully processed ${gcsFilePath}.`);
 
     } catch (error) {
-        console.error(`[${fileName}] An error occurred during processing:`, error, error.stack);
-        res.status(500).send(`Error processing ${fileName}.`);
+        console.error(`[${gcsFilePath}] An error occurred during processing:`, error.stack);
+        res.status(500).send(`Error processing ${gcsFilePath}.`);
     } finally {
         try {
             if (fs.existsSync(tempFilePath)) {
                 fs.unlinkSync(tempFilePath); // Clean up the temporary file
             }
         } catch (e) {
-            console.error(`[${fileName}] Error deleting temporary file:`, e);
+            console.error(`[${gcsFilePath}] Error deleting temporary file:`, e);
         }
-        console.log(`[END] Finished processing for file: ${fileName}.`);
+        console.log(`[END] Finished processing for file: ${gcsFilePath}.`);
     }
 };
 
@@ -207,25 +186,24 @@ app.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
 });
 
-
 /**
  * Helper function to resize an image and save it to the destination bucket.
- * @param {object} sourceFile The GCS file object for the original image.
+ * @param {string} sourceTempPath The temporary local path to the source image.
  * @param {object} destBucket The GCS bucket object for the destination.
- * @param {string} originalFileName The name of the original file.
+ * @param {string} originalGcsPath The original GCS path of the file.
  * @param {number} width The target width for resizing.
  */
-const resizeAndSave = (sourceFile, destBucket, originalFileName, width) => {
+const resizeAndSave = (sourceTempPath, destBucket, originalGcsPath, width) => {
     return new Promise((resolve, reject) => {
-        const { name, dir } = path.parse(originalFileName);
-        const newFileName = `${dir ? `${dir}/` : ''}${name}_w${width}.webp`;
+        const originalPathParts = path.parse(originalGcsPath);
+        // Place resized images in a path structure like: uploads/user_id/w1200/image.webp
+        const newFileName = path.join(originalPathParts.dir, `w${width}`, `${originalPathParts.name}.webp`);
 
-        const readStream = sourceFile.createReadStream();
         const writeStream = destBucket.file(newFileName).createWriteStream({
             metadata: { contentType: 'image/webp' },
         });
 
-        const transformer = sharp()
+        const transformer = sharp(sourceTempPath)
             .resize(width)
             .webp({
                 nearLossless: true,
@@ -233,12 +211,11 @@ const resizeAndSave = (sourceFile, destBucket, originalFileName, width) => {
                 effort: 3
             });
 
-        readStream
-            .pipe(transformer)
+        transformer
             .pipe(writeStream)
             .on('finish', () => {
                 console.log(`Successfully created resized image: ${newFileName}`);
-                resolve(newFileName);
+                resolve({ fileName: newFileName, width: width });
             })
             .on('error', (err) => {
                 console.error(`Failed to create resized image: ${newFileName}`, err);
