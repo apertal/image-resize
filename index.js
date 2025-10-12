@@ -71,16 +71,27 @@ const processImage = async (req, res) => {
         await originalFile.download({ destination: tempFilePath });
 
         console.log(`[${gcsFilePath}] Step 2: Finding image record in Supabase.`);
-        const { data: imageRecord, error: findError } = await supabase
+        const { data: imageRecords, error: findError } = await supabase
             .from('images')
             .select('id')
             .eq('gcs_file_path', gcsFilePath)
-            .single();
+            .limit(1);
 
-        if (findError || !imageRecord) {
-            console.error(`[${gcsFilePath}] Image not found in database.`, findError);
+        if (findError) {
+            console.error(`[${gcsFilePath}] Error finding image in Supabase:`, findError);
+            return res.status(500).send('Error finding image in database.');
+        }
+
+        if (!imageRecords || imageRecords.length === 0) {
+            console.error(`[${gcsFilePath}] Image not found in database.`);
             return res.status(404).send(`Image not found in database.`);
         }
+
+        if (imageRecords.length > 1) {
+            console.warn(`[${gcsFilePath}] Multiple records found for this GCS path. Using the first one.`);
+        }
+
+        const imageRecord = imageRecords[0];
         console.log(`[${gcsFilePath}] Step 2: Found image record with ID: ${imageRecord.id}.`);
 
         console.log(`[${gcsFilePath}] Step 3: Extracting and sanitizing EXIF data.`);
