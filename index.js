@@ -76,10 +76,23 @@ const processImage = async (req, res) => {
         }
         console.log(`[${gcsFilePath}] Step 2: Found image record with ID: ${imageRecord.id}.`);
 
-        // --- 3. EXIF Extraction ---
+        // --- 3. EXIF Extraction and Pruning ---
         console.log(`[${gcsFilePath}] Step 3: Extracting EXIF data.`);
         const exifData = await exiftool.read(tempFilePath);
         console.log(`[${gcsFilePath}] Step 3: EXIF extraction complete.`);
+
+        // Prune large binary tags from EXIF data to prevent payload size errors
+        if (exifData.ThumbnailImage) {
+            console.log(`[${gcsFilePath}] Pruning ThumbnailImage from EXIF data.`);
+            delete exifData.ThumbnailImage;
+        }
+        if (exifData.PreviewImage) {
+            console.log(`[${gcsFilePath}] Pruning PreviewImage from EXIF data.`);
+            delete exifData.PreviewImage;
+        }
+
+        const exifDataString = JSON.stringify(exifData);
+        console.log(`[${gcsFilePath}] Size of pruned EXIF data payload: ${exifDataString.length} bytes.`);
 
         // --- 4. Safety Check with Vision AI ---
         console.log(`[${gcsFilePath}] Step 4: Performing SafeSearch detection.`);
@@ -118,7 +131,6 @@ const processImage = async (req, res) => {
 
             const failedResults = resizeResults.filter(r => r instanceof Error);
             if (failedResults.length > 0) {
-                // Log each error for better debugging
                 failedResults.forEach(e => console.error(`[${gcsFilePath}] A resize operation failed:`, e));
                 throw new Error(`${failedResults.length} resize operations failed`);
             }
@@ -134,33 +146,33 @@ const processImage = async (req, res) => {
                     console.error(`[${gcsFilePath}] Failed to delete successfully created image: ${imageName}`, deleteError);
                 }
             }
-            throw error; // Re-throw to be caught by the main try-catch block
+            throw error;
         }
         console.log(`[${gcsFilePath}] Step 5: Resizing complete.`);
 
         // --- 6. Final Supabase Update ---
-        console.log(`[${gcsFilePath}] Step 6: Updating Supabase record with EXIF and resized paths.`);
-        const { data: updatedData, error: updateError } = await supabase
-            .from('images')
-            .update({
-                exif: exifData,
-                processed_sizes: processedSizes,
-                processed: true
-            })
-            .eq('id', imageRecord.id)
-            .select(); // IMPORTANT: .select() returns the updated rows
+        console.log(`[${gcsFilePath}] Step 6: Updating Supabase record.`);
+        try {
+            const { data: updatedData, error: updateError } = await supabase
+                .from('images')
+                .update({
+                    exif: exifData,
+                    processed_sizes: processedSizes,
+                    processed: true
+                })
+                .eq('id', imageRecord.id)
+                .select();
 
-        if (updateError) {
-            console.error(`[${gcsFilePath}] Supabase update error:`, updateError);
-            // If the update fails, the operation is considered failed. The main catch block will handle it.
+            if (updateError) throw updateError;
+
+            if (updatedData && updatedData.length > 0) {
+                console.log(`[${gcsFilePath}] Supabase record updated successfully. Response:`, JSON.stringify(updatedData));
+            } else {
+                console.warn(`[${gcsFilePath}] Supabase update call returned no data. 0 rows may have been updated. Check RLS policies and permissions.`);
+            }
+        } catch (err) {
+            console.error(`[${gcsFilePath}] Exception during Supabase update:`, JSON.stringify(err, null, 2));
             throw new Error('Supabase update error');
-        }
-
-        // New logging to verify the update
-        if (updatedData && updatedData.length > 0) {
-            console.log(`[${gcsFilePath}] Supabase record updated successfully. Response:`, JSON.stringify(updatedData));
-        } else {
-            console.warn(`[${gcsFilePath}] Supabase update call returned no data. 0 rows may have been updated. Check RLS policies and permissions.`);
         }
 
         // --- 7. Move Original File to Processed Bucket ---
@@ -172,12 +184,12 @@ const processImage = async (req, res) => {
         res.status(200).send(`Successfully processed ${gcsFilePath}.`);
 
     } catch (error) {
-        console.error(`[${gcsFilePath}] An error occurred during processing:`, error.stack);
+        console.error(`[${gcsFilePath}] An error occurred during processing:`, error.message);
         res.status(500).send(`Error processing ${gcsFilePath}.`);
     } finally {
         try {
             if (fs.existsSync(tempFilePath)) {
-                fs.unlinkSync(tempFilePath); // Clean up the temporary file
+                fs.unlinkSync(tempFilePath);
             }
         } catch (e) {
             console.error(`[${gcsFilePath}] Error deleting temporary file:`, e);
@@ -203,7 +215,6 @@ app.listen(PORT, () => {
 const resizeAndSave = (sourceTempPath, destBucket, originalGcsPath, width) => {
     return new Promise((resolve, reject) => {
         const originalPathParts = path.parse(originalGcsPath);
-        // Place resized images in a path structure like: uploads/user_id/w1200/image.webp
         const newFileName = path.join(originalPathParts.dir, `w${width}`, `${originalPathParts.name}.webp`);
 
         const writeStream = destBucket.file(newFileName).createWriteStream({
@@ -213,7 +224,7 @@ const resizeAndSave = (sourceTempPath, destBucket, originalGcsPath, width) => {
         const transformer = sharp(sourceTempPath)
             .resize(width)
             .webp({
-                quality: 80, // Adjusted for better compression
+                quality: 80,
             });
 
         transformer
