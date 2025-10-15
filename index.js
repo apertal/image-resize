@@ -94,6 +94,16 @@ const processImage = async (req, res) => {
         const imageRecord = imageRecords[0];
         console.log(`[${gcsFilePath}] Step 2: Found image record with ID: ${imageRecord.id}.`);
 
+        console.log(`[${gcsFilePath}] Step 2.1: Updating image status to 'processing'.`);
+        const { error: updateError } = await supabase
+            .from('images')
+            .update({ status: 'processing' })
+            .eq('id', imageRecord.id);
+
+        if (updateError) {
+            console.error(`[${gcsFilePath}] Error updating image status to 'processing':`, updateError);
+        }
+
         console.log(`[${gcsFilePath}] Step 3: Extracting and sanitizing EXIF data.`);
         const exifData = await exiftool.read(tempFilePath);
         if (exifData.ThumbnailImage) delete exifData.ThumbnailImage;
