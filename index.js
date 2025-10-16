@@ -102,27 +102,28 @@ const processImage = async (req, res) => {
             return res.status(200).send(`Unsafe image deleted.`);
         }
 
-        console.log(`[${gcsFilePath}] Step 5: Generating resized images.`);
-        const resizePromises = RESIZE_WIDTHS.map(width =>
-            resizeAndSave(tempFilePath, destinationBucket, gcsFilePath, width)
-        );
-        const processedSizes = {};
-        const resizeResults = await Promise.all(resizePromises);
-        resizeResults.forEach(r => { processedSizes[r.width] = r.fileName; });
+        console.log(`[${gcsFilePath}] Step 5: Extracting image dimensions.`);
+        const { width: originalWidth, height: originalHeight } = await sharp(tempFilePath).metadata();
+        console.log(`[${gcsFilePath}] Extracted original dimensions: ${originalWidth}x${originalHeight}`);
 
-        console.log(`[${gcsFilePath}] Step 6: Updating Supabase record via RPC.`);
+        console.log(`[${gcsFilePath}] Step 6: Generating resized images sequentially.`);
+        const processedSizes = {};
+        for (const width of RESIZE_WIDTHS) {
+            const resizeResult = await resizeAndSave(tempFilePath, destinationBucket, gcsFilePath, width);
+            processedSizes[resizeResult.width] = resizeResult.fileName;
+        }
+
+        console.log(`[${gcsFilePath}] Step 7: Updating Supabase record via RPC.`);
         const { error: rpcError } = await supabase.rpc('update_image_processing_results', {
             image_id_input: imageRecord.id,
             exif_data_input: sanitizedExifData,
-            processed_sizes_input: processedSizes
+            processed_sizes_input: processedSizes,
+            width_input: originalWidth,
+            height_input: originalHeight
         });
 
         if (rpcError) throw rpcError;
         console.log(`[${gcsFilePath}] Supabase RPC call successful.`);
-
-        console.log(`[${gcsFilePath}] Step 7: Moving original file.`);
-        const destinationPath = path.join('originals', path.basename(gcsFilePath));
-        await originalFile.move(destinationBucket.file(destinationPath));
 
         res.status(200).send(`Successfully processed ${gcsFilePath}.`);
 
@@ -145,7 +146,7 @@ app.listen(PORT, () => {
 const resizeAndSave = (sourceTempPath, destBucket, originalGcsPath, width) => {
     return new Promise((resolve, reject) => {
         const originalPathParts = path.parse(originalGcsPath);
-        const newFileName = path.join(originalPathParts.dir, `w${width}`, `${originalPathParts.name}.webp`);
+        const newFileName = path.join('processed', `w${width}`, `${originalPathParts.name}.webp`);
         const writeStream = destBucket.file(newFileName).createWriteStream({ metadata: { contentType: 'image/webp' } });
         const transformer = sharp(sourceTempPath).resize(width).webp({ quality: 80 });
 
