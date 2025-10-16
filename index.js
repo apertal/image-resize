@@ -61,7 +61,8 @@ const processImage = async (req, res) => {
     const sourceBucket = storage.bucket(bucket);
     const destinationBucket = storage.bucket(PROCESSED_BUCKET_NAME);
     const originalFile = sourceBucket.file(gcsFilePath);
-    const tempFilePath = path.join(os.tmpdir(), path.basename(gcsFilePath));
+    const tempFileName = `${Date.now()}-${Math.round(Math.random() * 1E9)}-${path.basename(gcsFilePath)}`;
+    const tempFilePath = path.join(os.tmpdir(), tempFileName);
 
     console.log(`[START] Processing file: ${gcsFilePath}`);
 
@@ -130,8 +131,12 @@ const processImage = async (req, res) => {
         console.log(`[${gcsFilePath}] Step 6: Generating resized images sequentially.`);
         const processedSizes = {};
         for (const width of RESIZE_WIDTHS) {
-            const resizeResult = await resizeAndSave(tempFilePath, destinationBucket, gcsFilePath, width);
-            processedSizes[resizeResult.width] = resizeResult.fileName;
+            if (width < originalWidth) {
+                const resizeResult = await resizeAndSave(tempFilePath, destinationBucket, gcsFilePath, width);
+                processedSizes[resizeResult.width] = resizeResult.fileName;
+            } else {
+                console.log(`[${gcsFilePath}] Skipping resize for width ${width} as it is larger than or equal to the original width ${originalWidth}.`);
+            }
         }
 
         console.log(`[${gcsFilePath}] Step 7: Updating Supabase record via RPC.`);
@@ -172,7 +177,7 @@ app.listen(PORT, () => {
 const resizeAndSave = (sourceTempPath, destBucket, originalGcsPath, width) => {
     return new Promise((resolve, reject) => {
         const originalPathParts = path.parse(originalGcsPath);
-        const newFileName = path.join('processed', `w${width}`, `${originalPathParts.name}.webp`);
+        const newFileName = path.join('processed', originalPathParts.name, `w${width}.webp`);
         const writeStream = destBucket.file(newFileName).createWriteStream({ metadata: { contentType: 'image/webp' } });
         const transformer = sharp(sourceTempPath).resize(width).webp({ quality: 80 });
 
