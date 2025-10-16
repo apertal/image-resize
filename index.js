@@ -71,17 +71,38 @@ const processImage = async (req, res) => {
         await originalFile.download({ destination: tempFilePath });
 
         console.log(`[${gcsFilePath}] Step 2: Finding image record in Supabase.`);
-        const { data: imageRecord, error: findError } = await supabase
+        const { data: imageRecords, error: findError } = await supabase
             .from('images')
             .select('id')
             .eq('gcs_file_path', gcsFilePath)
-            .single();
+            .limit(1);
 
-        if (findError || !imageRecord) {
-            console.error(`[${gcsFilePath}] Image not found in database.`, findError);
+        if (findError) {
+            console.error(`[${gcsFilePath}] Error finding image in Supabase:`, findError);
+            return res.status(500).send('Error finding image in database.');
+        }
+
+        if (!imageRecords || imageRecords.length === 0) {
+            console.error(`[${gcsFilePath}] Image not found in database.`);
             return res.status(404).send(`Image not found in database.`);
         }
+
+        if (imageRecords.length > 1) {
+            console.warn(`[${gcsFilePath}] Multiple records found for this GCS path. Using the first one.`);
+        }
+
+        const imageRecord = imageRecords[0];
         console.log(`[${gcsFilePath}] Step 2: Found image record with ID: ${imageRecord.id}.`);
+
+        console.log(`[${gcsFilePath}] Step 2.1: Updating image status to 'processing'.`);
+        const { error: updateError } = await supabase
+            .from('images')
+            .update({ status: 'processing' })
+            .eq('id', imageRecord.id);
+
+        if (updateError) {
+            console.error(`[${gcsFilePath}] Error updating image status to 'processing':`, updateError);
+        }
 
         console.log(`[${gcsFilePath}] Step 3: Extracting and sanitizing EXIF data.`);
         const exifData = await exiftool.read(tempFilePath);
@@ -114,15 +135,20 @@ const processImage = async (req, res) => {
         }
 
         console.log(`[${gcsFilePath}] Step 7: Updating Supabase record via RPC.`);
-        const { error: rpcError } = await supabase.rpc('update_image_processing_results', {
+        const rpcPayload = {
             image_id_input: imageRecord.id,
             exif_data_input: sanitizedExifData,
             processed_sizes_input: processedSizes,
             width_input: originalWidth,
             height_input: originalHeight
-        });
+        };
+        console.log(`[${gcsFilePath}] RPC Payload:`, JSON.stringify(rpcPayload, null, 2));
+        const { error: rpcError } = await supabase.rpc('update_image_processing_results', rpcPayload);
 
-        if (rpcError) throw rpcError;
+        if (rpcError) {
+            console.error(`[${gcsFilePath}] Supabase RPC Error:`, JSON.stringify(rpcError, null, 2));
+            throw rpcError;
+        }
         console.log(`[${gcsFilePath}] Supabase RPC call successful.`);
 
         res.status(200).send(`Successfully processed ${gcsFilePath}.`);
