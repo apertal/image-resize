@@ -177,7 +177,8 @@ app.listen(PORT, () => {
 const resizeAndSave = (sourceTempPath, destBucket, originalGcsPath, width) => {
     return new Promise((resolve, reject) => {
         const originalPathParts = path.parse(originalGcsPath);
-        const newFileName = path.join('processed', originalPathParts.name, `w${width}.webp`);
+        const userId = path.basename(path.dirname(originalGcsPath));
+        const newFileName = path.join('processed', userId, `w${width}`, `${originalPathParts.name}.webp`);
         const writeStream = destBucket.file(newFileName).createWriteStream({ metadata: { contentType: 'image/webp' } });
         const transformer = sharp(sourceTempPath).resize(width).webp({ quality: 80 });
 
